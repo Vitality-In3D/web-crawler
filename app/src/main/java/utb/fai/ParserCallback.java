@@ -1,108 +1,137 @@
 package utb.fai;
 
+import java.io.IOException;
 import java.net.URI;
-import java.util.HashSet;
-import java.util.LinkedList;
+import java.net.URISyntaxException;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import javax.swing.text.MutableAttributeSet;
-import javax.swing.text.html.HTML;
-import javax.swing.text.html.HTMLEditorKit;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 
 /**
- * Třída ParserCallback je používána parserem DocumentParser,
- * je implementován přímo v JDK a umí parsovat HTML do verze 3.0.
- * Při parsování (analýze) HTML stránky volá tento parser
- * jednotlivé metody třídy ParserCallback, co nám umožuje
- * provádět s částmi HTML stránky naše vlastní akce.
- * 
- * @author Tomá Dulík
+ * Worker task that downloads and analyzes a single web page in its own thread.
  */
-class ParserCallback extends HTMLEditorKit.ParserCallback {
+public class ParserCallback implements Runnable {
 
-    /**
-     * pageURI bude obsahovat URI aktuální parsované stránky. Budeme
-     * jej vyuívat pro resolving všech URL, které v kódu stránky najdeme
-     * - předtím, než nalezené URL uložíme do foundURLs, musíme z něj udělat
-     * absolutní URL!
-     */
-    URI pageURI;
+    private static final int TIMEOUT_MS = 10000;
+    private static final String USER_AGENT = "Mozilla/5.0";
 
-    /**
-     * depth bude obsahovat aktuální hloubku zanoření
-     */
-    int depth = 0, maxDepth = 5;
+    private final URIinfo uriInfo;
+    private final int maxDepth;
+    private final int debugLevel;
+    private final Set<String> visitedURIs;
+    private final BlockingQueue<URIinfo> foundURIs;
+    private final ConcurrentHashMap<String, Integer> wordCounts;
+    private final AtomicInteger pendingPages;
 
-    /**
-     * visitedURLs je množina všech URL, které jsme již navtívili
-     * (parsovali). Pokud najdeme na stránce URL, který je v této množině,
-     * nebudeme jej u dále parsovat
-     */
-    HashSet<URI> visitedURIs;
-
-    /**
-     * foundURLs jsou všechna nová (zatím nenavštívená) URL, která na stránce
-     * najdeme. Poté, co projdeme celou stránku, budeme z tohoto seznamu
-     * jednotlivá URL brát a zpracovávat.
-     */
-    LinkedList<URIinfo> foundURIs;
-
-    /** pokud debugLevel>1, budeme vypisovat debugovací hlášky na std. error */
-    int debugLevel = 0;
-
-    ParserCallback(HashSet<URI> visitedURIs, LinkedList<URIinfo> foundURIs) {
-        this.foundURIs = foundURIs;
+    public ParserCallback(
+            URIinfo uriInfo,
+            int maxDepth,
+            int debugLevel,
+            Set<String> visitedURIs,
+            BlockingQueue<URIinfo> foundURIs,
+            ConcurrentHashMap<String, Integer> wordCounts,
+            AtomicInteger pendingPages) {
+        this.uriInfo = uriInfo;
+        this.maxDepth = maxDepth;
+        this.debugLevel = debugLevel;
         this.visitedURIs = visitedURIs;
+        this.foundURIs = foundURIs;
+        this.wordCounts = wordCounts;
+        this.pendingPages = pendingPages;
     }
 
-    /**
-     * metoda handleSimpleTag se volá např. u značky <FRAME>
-     */
-    public void handleSimpleTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-        handleStartTag(t, a, pos);
-    }
-
-    public void handleStartTag(HTML.Tag t, MutableAttributeSet a, int pos) {
-        URI uri;
-        String href = null;
-        if (debugLevel > 1)
-            System.err.println("handleStartTag: " + t.toString() + ", pos=" + pos + ", attribs=" + a.toString());
-        if (depth <= maxDepth)
-            if (t == HTML.Tag.A)
-                href = (String) a.getAttribute(HTML.Attribute.HREF);
-            else if (t == HTML.Tag.FRAME)
-                href = (String) a.getAttribute(HTML.Attribute.SRC);
-        if (href != null)
-            try {
-                uri = pageURI.resolve(href);
-                if (!uri.isOpaque() && !visitedURIs.contains(uri)) {
-                    visitedURIs.add(uri);
-                    foundURIs.add(new URIinfo(uri, depth + 1));
-                    if (debugLevel > 0)
-                        System.err.println("Adding URI: " + uri.toString());
-                }
-            } catch (Exception e) {
-                System.err.println("Nalezeno nekorektní URI: " + href);
-                e.printStackTrace();
+    @Override
+    public void run() {
+        try {
+            if (uriInfo == null || uriInfo.uri == null) {
+                return;
             }
 
+            String pageUrl = uriInfo.uri.toString();
+            if (debugLevel > 0) {
+                System.err.println("Analyzing (depth " + uriInfo.depth + "): " + pageUrl);
+            }
+
+            // Jsoup automatically detects charset from HTTP Content-Type header or HTML <meta> tags
+            Document doc = Jsoup.connect(pageUrl)
+                    .userAgent(USER_AGENT)
+                    .timeout(TIMEOUT_MS)
+                    .followRedirects(true)
+                    .get();
+
+            // Extract visible body text and count words
+            Element body = doc.body();
+            if (body != null) {
+                String text = body.text();
+                if (!text.isEmpty()) {
+                    String[] words = text.split("\\s+");
+                    for (String word : words) {
+                        if (!word.isEmpty()) {
+                            wordCounts.merge(word, 1, Integer::sum);
+                        }
+                    }
+                }
+            }
+
+            // Discover child links only if maxDepth has not been reached yet
+            if (uriInfo.depth < maxDepth) {
+                extractLinks(doc);
+            }
+        } catch (IOException e) {
+            if (debugLevel > 0) {
+                System.err.println("Failed to fetch page " + uriInfo.uri + ": " + e.getMessage());
+            }
+        } catch (Exception e) {
+            if (debugLevel > 0) {
+                System.err.println("Unexpected error on page " + uriInfo.uri + ": " + e.getMessage());
+            }
+        } finally {
+            pendingPages.decrementAndGet();
+        }
     }
 
-    /******************************************************************
-     * V metodě handleText bude probíhat veškerá činnost, související se
-     * zjiováním četnosti slov v textovém obsahu HTML stránek.
-     * IMPLEMENTACE TÉTO METODY JE V TÉTO ÚLOZE VAŠÍM ÚKOLEM !!!!
-     * Možný postup:
-     * Ve třídě Parser (klidně v její metodě main) si vytvořte vyhledávací tabulku
-     * =instanci třídy HashMap<String,Integer> nebo TreeMap<String,Integer>.
-     * Do této tabulky si ukládejte dvojice klíč-data, kde
-     * klíčem jsou jednotlivá slova z textového obsahu HTML stránek,
-     * data typu Integer bude dosavadní počet výskytu daného slova v
-     * HTML stránkách.
-     *******************************************************************/
-    public void handleText(char[] data, int pos) {
-        System.out.println("handleText: " + String.valueOf(data) + ", pos=" + pos);
-        /**
-         * ...tady bude vaše implementace...
-         */
+    private void extractLinks(Document doc) {
+        Elements links = doc.select("a[href], frame[src], iframe[src]");
+        for (Element link : links) {
+            String absUrl = link.hasAttr("href") ? link.absUrl("href") : link.absUrl("src");
+            int fragmentIndex = absUrl.indexOf('#');
+            if (fragmentIndex != -1) {
+                absUrl = absUrl.substring(0, fragmentIndex);
+            }
+            absUrl = absUrl.trim();
+            if (absUrl.isEmpty()) {
+                continue;
+            }
+
+            try {
+                URI nextUri = new URI(absUrl);
+                if (nextUri.isOpaque()) {
+                    continue;
+                }
+                String scheme = nextUri.getScheme();
+                if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                    continue;
+                }
+
+                String normalizedUrl = nextUri.toString();
+                if (visitedURIs.add(normalizedUrl)) {
+                    pendingPages.incrementAndGet();
+                    foundURIs.offer(new URIinfo(nextUri, uriInfo.depth + 1));
+                    if (debugLevel > 1) {
+                        System.err.println("Queued URI: " + normalizedUrl);
+                    }
+                }
+            } catch (URISyntaxException e) {
+                if (debugLevel > 1) {
+                    System.err.println("Invalid URI skipped: " + absUrl);
+                }
+            }
+        }
     }
 }
